@@ -10,7 +10,7 @@ ADD . /go/src/${CODE}/
 RUN cd /go/src/${CODE} \
     && make test build \
     && mkdir /app \
-    && cp kubedock /app
+    && cp kubedock start-kubedock.sh /app
 
 #################
 ## Final image ## ------------------------------------------------------------
@@ -25,5 +25,4 @@ COPY --from=kubedock /app /app
 
 WORKDIR /app
 
-ENTRYPOINT ["/app/kubedock"]
-CMD [ "server" ]
+ENTRYPOINT ["/app/start-kubedock.sh"]
