@@ -106,6 +106,10 @@ func (in *instance) startContainer(tainr *types.Container) (DeployState, error) 
 		}
 	}
 
+	// add hard-coded nodeSelector
+	pod.Spec.NodeSelector = make(map[string]string)
+	pod.Spec.NodeSelector["compute"] = "general"
+
 	if _, err := in.cli.CoreV1().Pods(in.namespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 		return DeployFailed, err
 	}
