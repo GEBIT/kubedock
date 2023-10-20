@@ -6,5 +6,15 @@ REQ_LIM_MEM="${KUBEDOCK_REQ_LIM_MEM:-2048Mi,4096Mi}"
 ENABLE_INSPECTOR="${KUBEDOCK_ENABLE_INSPECTOR:-}"
 ENABLE_REVERSE_PROXY="${KUBEDOCK_ENABLE_REVERSE_PROXY:---reverse-proxy}"
 PULL_POLICY="${KUBEDOCK_PULL_POLICY:-always}"
+REAP_MAX="${KUBEDOCK_REAP_MAX:-30m}"
 
-/app/kubedock server -n $JENKINS_SHORTNAME -v $VERBOSE $ENABLE_INSPECTOR $ENABLE_REVERSE_PROXY --request-cpu $REQ_LIM_CPU --request-memory $REQ_LIM_MEM --pull-policy $PULL_POLICY $@
+/app/kubedock server \
+  -n $JENKINS_SHORTNAME \
+  -v $VERBOSE \
+  $ENABLE_INSPECTOR \
+  $ENABLE_REVERSE_PROXY \
+  --request-cpu $REQ_LIM_CPU \
+  --request-memory $REQ_LIM_MEM \
+  --pull-policy $PULL_POLICY \
+  --reapmax $REAP_MAX
+  $@
