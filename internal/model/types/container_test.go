@@ -3,10 +3,12 @@ package types
 import (
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestNew(t *testing.T) {
@@ -56,10 +58,13 @@ func TestGetEnvVar(t *testing.T) {
 }
 
 func TestGetResourceRequirements(t *testing.T) {
+	mem64, _ := resource.ParseQuantity("64Mi")
+
 	tests := []struct {
-		in     *Container
-		reqlim map[string]string
-		err    bool
+		in        *Container
+		resources corev1.ResourceRequirements
+		reqlim    map[string]string
+		err       bool
 	}{
 		{ // 0
 			in:     &Container{Labels: map[string]string{}},
@@ -157,9 +162,33 @@ func TestGetResourceRequirements(t *testing.T) {
 			reqlim: map[string]string{"reqmem": "209715200"},
 			err:    false,
 		},
+		{ // 14
+			in: &Container{Labels: map[string]string{
+				"com.joyrex2001.kubedock.request-memory": "209715200",
+			}},
+			reqlim: map[string]string{"reqmem": "209715200", "limmem": mem64.String()},
+			resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					"memory": mem64,
+				},
+			},
+			err: false,
+		},
+		{ // 15
+			in: &Container{Labels: map[string]string{
+				"com.joyrex2001.kubedock.request-memory": "209715200",
+			}},
+			reqlim: map[string]string{"reqmem": "209715200"},
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					"memory": mem64,
+				},
+			},
+			err: false,
+		},
 	}
 	for i, tst := range tests {
-		res, err := tst.in.GetResourceRequirements()
+		res, err := tst.in.GetResourceRequirements(tst.resources)
 		if err != nil && !tst.err {
 			t.Errorf("failed test %d - unexpected error: %s", i, err)
 		}
@@ -603,15 +632,27 @@ func TestVolumes(t *testing.T) {
 		folders map[string]string
 		files   map[string]string
 		vol     bool
+		sock    bool
 	}{
 		{
-			in: &Container{Binds: []string{
-				"container_test.go:/tmp/container_test.go:ro",
-				"../types:/tmp/types:ro",
-			}},
+			in: &Container{
+				Binds: []string{
+					"container_test.go:/tmp/container_test.go:ro",
+					"../types:/tmp/types:ro",
+					"/var/run/docker.sock:/var/run/docker.sock:rw",
+				},
+				Mounts: []Mount{{
+					Source:   "/abc",
+					Target:   "def",
+					ReadOnly: false,
+					Type:     "bind",
+				}},
+			},
 			all: map[string]string{
 				"/tmp/container_test.go": "container_test.go",
 				"/tmp/types":             "../types",
+				"/var/run/docker.sock":   "/var/run/docker.sock",
+				"def":                    "/abc",
 			},
 			files: map[string]string{
 				"/tmp/container_test.go": "container_test.go",
@@ -619,7 +660,8 @@ func TestVolumes(t *testing.T) {
 			folders: map[string]string{
 				"/tmp/types": "../types",
 			},
-			vol: true,
+			vol:  true,
+			sock: true,
 		},
 		{
 			in:      &Container{Binds: []string{}},
@@ -627,6 +669,7 @@ func TestVolumes(t *testing.T) {
 			files:   map[string]string{},
 			folders: map[string]string{},
 			vol:     false,
+			sock:    false,
 		},
 	}
 	for i, tst := range tests {
@@ -643,7 +686,10 @@ func TestVolumes(t *testing.T) {
 			t.Errorf("failed test %d folders - expected %v, but got %v", i, tst.folders, res)
 		}
 		if tst.in.HasVolumes() != tst.vol {
-			t.Errorf("failed test %d - expected %t, but got %t", i, tst.in.HasVolumes(), tst.vol)
+			t.Errorf("failed test %d volumes- expected %t, but got %t", i, tst.in.HasVolumes(), tst.vol)
+		}
+		if tst.in.HasDockerSockBinding() != tst.sock {
+			t.Errorf("failed test %d sock - expected %t, but got %t", i, tst.in.HasDockerSockBinding(), tst.sock)
 		}
 	}
 }
@@ -738,4 +784,52 @@ func TestMatch(t *testing.T) {
 
 func makeIntPointer(x int64) *int64 {
 	return &x
+}
+
+func ptrToString(v *int64) string {
+	if v == nil {
+		return "nil"
+	}
+	return strconv.FormatInt(*v, 10)
+}
+
+func TestGetActiveDeadlineSeconds(t *testing.T) {
+	tests := []struct {
+		in       *Container
+		deadline *int64
+		err      bool
+	}{
+		{ // 0
+			in:       &Container{Labels: map[string]string{}},
+			deadline: nil,
+			err:      false,
+		},
+		{ // 1
+			in: &Container{Labels: map[string]string{
+				"com.joyrex2001.kubedock.active-deadline-seconds": "42",
+			}},
+			deadline: makeIntPointer(42),
+			err:      false,
+		},
+		{ // 2
+			in: &Container{Labels: map[string]string{
+				"com.joyrex2001.kubedock.active-deadline-seconds": "foo",
+			}},
+			deadline: nil,
+			err:      true,
+		},
+	}
+
+	for i, tst := range tests {
+		res, err := tst.in.GetActiveDeadlineSeconds()
+		if err != nil && !tst.err {
+			t.Errorf("failed test %d - unexpected error: %s", i, err)
+		}
+		if err == nil && tst.err {
+			t.Errorf("failed test %d - expected error, but succeeded without error", i)
+		}
+		if !reflect.DeepEqual(tst.deadline, res) {
+			t.Errorf("failed test %d - expected %s, but got %s", i, ptrToString(tst.deadline), ptrToString(res))
+		}
+	}
 }

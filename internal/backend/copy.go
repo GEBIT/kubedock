@@ -71,16 +71,12 @@ func (in *instance) GetFileModeInContainer(tainr *types.Container, target string
 	var b bytes.Buffer
 	writer := bufio.NewWriter(&b)
 
-	target = strings.ReplaceAll(target, "`", "")
-	target = strings.ReplaceAll(target, "$", "")
-	target = strings.ReplaceAll(target, "\"", "\\\"")
-
 	err = exec.RemoteCmd(exec.Request{
 		Client:     in.cli,
 		RestConfig: in.cfg,
 		Pod:        *pod,
 		Container:  "main",
-		Cmd:        []string{"sh", "-c", "if [ -d \"" + target + "\" ]; then echo folder; else echo file; fi"},
+		Cmd:        []string{"sh", "-c", "if [ -d \"" + sanitizeFilename(target) + "\" ]; then echo folder; else echo file; fi"},
 		Stdout:     writer,
 	})
 	if err != nil {
@@ -93,4 +89,44 @@ func (in *instance) GetFileModeInContainer(tainr *types.Container, target string
 	}
 
 	return mode, nil
+}
+
+// FileExistsInContainer will check if the file exists in the container.
+func (in *instance) FileExistsInContainer(tainr *types.Container, target string) (bool, error) {
+	pod, err := in.cli.CoreV1().Pods(in.namespace).Get(context.Background(), tainr.GetPodName(), metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	var b bytes.Buffer
+	writer := bufio.NewWriter(&b)
+
+	err = exec.RemoteCmd(exec.Request{
+		Client:     in.cli,
+		RestConfig: in.cfg,
+		Pod:        *pod,
+		Container:  "main",
+		Cmd:        []string{"sh", "-c", "if [ -e \"" + sanitizeFilename(target) + "\" ]; then echo true; else echo false; fi"},
+		Stdout:     writer,
+	})
+
+	if err != nil {
+		return false, err
+	}
+
+	exists := false
+	if strings.Contains(string(b.Bytes()), "true") {
+		exists = true
+	}
+
+	return exists, nil
+}
+
+// sanitizeFilename will clean up unwanted characters from the filename to
+// prevent injection attacks.
+func sanitizeFilename(file string) string {
+	file = strings.ReplaceAll(file, "`", "")
+	file = strings.ReplaceAll(file, "$", "")
+	file = strings.ReplaceAll(file, "\"", "\\\"")
+	return file
 }

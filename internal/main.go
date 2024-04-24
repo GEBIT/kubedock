@@ -21,11 +21,12 @@ import (
 	"github.com/joyrex2001/kubedock/internal/config"
 	"github.com/joyrex2001/kubedock/internal/reaper"
 	"github.com/joyrex2001/kubedock/internal/server"
+	"github.com/joyrex2001/kubedock/internal/util/myip"
 )
 
 // Main is the main entry point for starting this service.
 func Main() {
-	klog.Info(config.VersionString())
+	klog.Infof("%s / kubedock.id=%s", config.VersionString(), config.InstanceID)
 
 	cfg, err := config.GetKubernetes()
 	if err != nil {
@@ -50,7 +51,7 @@ func Main() {
 	// just start the show...
 	if !viper.GetBool("lock.enabled") {
 		run(ctx, kub)
-		return
+		select {}
 	}
 
 	// exclusive mode, use the k8s leader election as a locking mechanism
@@ -85,12 +86,15 @@ func Main() {
 			},
 		},
 	})
+	select {}
 }
 
-// getBackend will instantiate a the kubedock kubernetes object.
+// getBackend will instantiate the kubedock kubernetes object.
 func getBackend(cfg *rest.Config, cli kubernetes.Interface) (backend.Backend, error) {
 	ns := viper.GetString("kubernetes.namespace")
 	initimg := viper.GetString("kubernetes.initimage")
+	dindimg := viper.GetString("kubernetes.dindimage")
+	disdind := viper.GetBool("kubernetes.disable-dind")
 	timeout := viper.GetDuration("kubernetes.timeout")
 	podtmpl := viper.GetString("kubernetes.pod-template")
 	imgpsr := strings.ReplaceAll(viper.GetString("kubernetes.image-pull-secrets"), " ", "")
@@ -102,18 +106,49 @@ func getBackend(cfg *rest.Config, cli kubernetes.Interface) (backend.Backend, er
 		imgps = strings.Split(imgpsr, ",")
 	}
 
-	klog.Infof("kubernetes config: namespace=%s, initimage=%s, ready timeout=%s%s", ns, initimg, timeout, optlog)
+	klog.Infof("kubernetes config: namespace=%s, initimage=%s, dindimage=%s, ready timeout=%s%s", ns, initimg, dindimg, timeout, optlog)
+	if disdind {
+		klog.Infof("docker-in-docker support disabled")
+	}
 
-	kub := backend.New(backend.Config{
+	kuburl, err := getKubedockURL()
+	if err != nil {
+		return nil, err
+	}
+	klog.V(3).Infof("kubedock url: %s", kuburl)
+
+	return backend.New(backend.Config{
 		Client:           cli,
 		RestConfig:       cfg,
 		Namespace:        ns,
 		InitImage:        initimg,
+		DindImage:        dindimg,
+		DisableDind:      disdind,
 		ImagePullSecrets: imgps,
 		PodTemplate:      podtmpl,
+		KubedockURL:      kuburl,
 		TimeOut:          timeout,
 	})
-	return kub, nil
+}
+
+// getKubedockURL returns the uri that can be used externally to reach
+// this kubedock instance.
+func getKubedockURL() (string, error) {
+	ip, err := myip.Get()
+	if err != nil {
+		return "", err
+	}
+
+	port := strings.Split(viper.GetString("server.listen-addr")+":", ":")[1]
+	if port == "" {
+		return "", fmt.Errorf("expected a port to be configured for listen-addr")
+	}
+
+	proto := "http"
+	if viper.GetBool("server.tls-enable") {
+		proto = "https"
+	}
+	return fmt.Sprintf("%s://%s:%s", proto, ip, port), nil
 }
 
 // run will start all components, based the settings initiated by cmd.
@@ -133,13 +168,13 @@ func run(ctx context.Context, kub backend.Backend) {
 	if viper.GetBool("prune-start") {
 		klog.Info("pruning all existing kubedock resources from namespace")
 		if err := kub.DeleteAll(); err != nil {
-			klog.Fatalf("error pruning resources: %s", err)
+			klog.Errorf("error pruning resources: %s", err)
 		}
 	}
 
 	svr := server.New(kub)
 	if err := svr.Run(ctx); err != nil {
-		klog.Fatalf("error instantiating server: %s", err)
+		klog.Errorf("error instantiating server: %s", err)
 	}
 }
 
@@ -175,8 +210,8 @@ func exitHandler(kub backend.Backend, cancel context.CancelFunc) {
 		<-sigc
 		cancel()
 		klog.Info("exit signal recieved, removing pods, configmaps and services")
-		if err := kub.DeleteWithKubedockID(config.DefaultLabels["kubedock.id"]); err != nil {
-			klog.Fatalf("error pruning resources: %s", err)
+		if err := kub.DeleteWithKubedockID(config.InstanceID); err != nil {
+			klog.Errorf("error pruning resources: %s", err)
 		}
 		os.Exit(0)
 	}()

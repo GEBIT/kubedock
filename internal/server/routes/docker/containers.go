@@ -41,6 +41,9 @@ func ContainerCreate(cr *common.ContextRouter, c *gin.Context) {
 		// The User defined in HTTP request takes precedence over the cli and label.
 		in.Labels[types.LabelRunasUser] = in.User
 	}
+	if _, ok := in.Labels[types.LabelNamePrefix]; !ok && cr.Config.NamePrefix != "" {
+		in.Labels[types.LabelNamePrefix] = cr.Config.NamePrefix
+	}
 	if _, ok := in.Labels[types.LabelRequestCPU]; !ok && cr.Config.RequestCPU != "" {
 		in.Labels[types.LabelRequestCPU] = cr.Config.RequestCPU
 	}
@@ -50,6 +53,9 @@ func ContainerCreate(cr *common.ContextRouter, c *gin.Context) {
 	if _, ok := in.Labels[types.LabelPullPolicy]; !ok && cr.Config.PullPolicy != "" {
 		in.Labels[types.LabelPullPolicy] = cr.Config.PullPolicy
 	}
+	if _, ok := in.Labels[types.LabelActiveDeadlineSeconds]; !ok && cr.Config.ActiveDeadlineSeconds >= 0 {
+		in.Labels[types.LabelActiveDeadlineSeconds] = fmt.Sprintf("%d", cr.Config.ActiveDeadlineSeconds)
+	}
 	if in.HostConfig.Memory != 0 {
 		in.Labels[types.LabelRequestMemory] = fmt.Sprintf("%d", in.HostConfig.Memory)
 	}
@@ -57,6 +63,20 @@ func ContainerCreate(cr *common.ContextRouter, c *gin.Context) {
 		in.Labels[types.LabelRequestCPU] = fmt.Sprintf("%dn", in.HostConfig.NanoCpus)
 	}
 	in.Labels[types.LabelServiceAccount] = cr.Config.ServiceAccount
+
+	mounts := []types.Mount{}
+	for _, m := range in.HostConfig.Mounts {
+		if m.Type != "bind" {
+			klog.Infof("mount '%s:%s' with type '%s' not supported, ignoring", m.Source, m.Target, m.Type)
+			continue
+		}
+		mounts = append(mounts, types.Mount{
+			Type:     m.Type,
+			Source:   m.Source,
+			Target:   m.Target,
+			ReadOnly: m.ReadOnly,
+		})
+	}
 
 	tainr := &types.Container{
 		Name:         in.Name,
@@ -68,6 +88,7 @@ func ContainerCreate(cr *common.ContextRouter, c *gin.Context) {
 		ImagePorts:   map[string]interface{}{},
 		Labels:       in.Labels,
 		Binds:        in.HostConfig.Binds,
+		Mounts:       mounts,
 		PreArchives:  []types.PreArchive{},
 	}
 
@@ -149,7 +170,7 @@ func ContainerWait(cr *common.ContextRouter, c *gin.Context) {
 // DELETE "/containers/:id"
 func ContainerDelete(cr *common.ContextRouter, c *gin.Context) {
 	id := c.Param("id")
-	tainr, err := cr.DB.GetContainer(id)
+	tainr, err := cr.DB.GetContainerByNameOrID(id)
 	if err != nil {
 		httputil.Error(c, http.StatusNotFound, err)
 		return
@@ -178,7 +199,7 @@ func ContainerDelete(cr *common.ContextRouter, c *gin.Context) {
 // GET "/containers/:id/json"
 func ContainerInfo(cr *common.ContextRouter, c *gin.Context) {
 	id := c.Param("id")
-	tainr, err := cr.DB.GetContainer(id)
+	tainr, err := cr.DB.GetContainerByNameOrID(id)
 	if err != nil {
 		httputil.Error(c, http.StatusNotFound, err)
 		return
@@ -210,29 +231,6 @@ func ContainerList(cr *common.ContextRouter, c *gin.Context) {
 	c.JSON(http.StatusOK, res)
 }
 
-// ContainerRename - rename a container.
-// https://docs.docker.com/engine/api/v1.41/#tag/Container/operation/ContainerRename
-// GET "/containers/:id/rename"
-func ContainerRename(cr *common.ContextRouter, c *gin.Context) {
-	id := c.Param("id")
-	tainr, err := cr.DB.GetContainer(id)
-	if err != nil {
-		httputil.Error(c, http.StatusNotFound, err)
-		return
-	}
-	name := c.Query("name")
-	if _, err := cr.DB.GetContainerByName(name); err == nil {
-		httputil.Error(c, http.StatusConflict, fmt.Errorf("name `%s` already in used", name))
-		return
-	}
-	tainr.Name = name
-	if err := cr.DB.SaveContainer(tainr); err != nil {
-		httputil.Error(c, http.StatusInternalServerError, err)
-		return
-	}
-	c.Writer.WriteHeader(http.StatusNoContent)
-}
-
 // getContainerInfo will return a gin.H containing the details of the
 // given container.
 func getContainerInfo(cr *common.ContextRouter, tainr *types.Container, detail bool) gin.H {
@@ -249,11 +247,21 @@ func getContainerInfo(cr *common.ContextRouter, tainr *types.Container, detail b
 			"IPAddress": "127.0.0.1",
 		}
 	}
+	mounts := []gin.H{}
+	for _, m := range tainr.Mounts {
+		mounts = append(mounts, gin.H{
+			"Source":   m.Source,
+			"Target":   m.Target,
+			"Type":     m.Type,
+			"ReadOnly": m.ReadOnly,
+		})
+	}
+	names := getContainerNames(tainr)
 	res := gin.H{
 		"Id":    tainr.ID,
-		"Name":  "/" + tainr.Name,
+		"Name":  names[0],
 		"Image": tainr.Image,
-		"Names": getContainerNames(tainr),
+		"Names": names,
 		"NetworkSettings": gin.H{
 			"IPAddress": "127.0.0.1",
 			"Networks":  netdtl,
@@ -265,6 +273,7 @@ func getContainerInfo(cr *common.ContextRouter, tainr *types.Container, detail b
 				"Type":   "json-file",
 				"Config": gin.H{},
 			},
+			"Mounts": mounts,
 		},
 	}
 	if detail {
@@ -285,11 +294,13 @@ func getContainerInfo(cr *common.ContextRouter, tainr *types.Container, detail b
 			"Error":      errstr,
 		}
 		res["Config"] = gin.H{
-			"Image":  tainr.Image,
-			"Labels": tainr.Labels,
-			"Env":    tainr.Env,
-			"Cmd":    tainr.Cmd,
-			"Tty":    false,
+			"Image":        tainr.Image,
+			"Labels":       tainr.Labels,
+			"Env":          tainr.Env,
+			"Cmd":          tainr.Cmd,
+			"Hostname":     "localhost",
+			"ExposedPorts": getConfigExposedPorts(cr, tainr),
+			"Tty":          false,
 		}
 		res["Created"] = tainr.Created.Format("2006-01-02T15:04:05Z")
 	} else {
@@ -324,6 +335,19 @@ func getNetworkSettingsPorts(cr *common.ContextRouter, tainr *types.Container) g
 			done[src] = 1
 		}
 		res[fmt.Sprintf("%d/tcp", dst)] = pp
+	}
+	return res
+}
+
+// getConfigExposedPorts will return the available ports of the container
+// as a gin.H json structure to be used in container config details.
+func getConfigExposedPorts(cr *common.ContextRouter, tainr *types.Container) gin.H {
+	res := gin.H{}
+	if tainr.HostIP == "" {
+		return res
+	}
+	for dst := range getAvailablePorts(cr, tainr) {
+		res[fmt.Sprintf("%d/tcp", dst)] = gin.H{}
 	}
 	return res
 }

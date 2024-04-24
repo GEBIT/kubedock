@@ -2,7 +2,7 @@
 ## Build kubedock ## ----------------------------------------------------------
 ####################
 
-FROM docker.io/golang:1.20 AS kubedock
+FROM docker.io/golang:1.21 AS kubedock
 
 ARG CODE=github.com/joyrex2001/kubedock
 
@@ -21,7 +21,7 @@ FROM alpine:3
 RUN apk add --no-cache ca-certificates \
     && update-ca-certificates
 
-COPY --from=kubedock /app /app
+COPY --from=kubedock /app /usr/local/bin
 
 WORKDIR /app
 

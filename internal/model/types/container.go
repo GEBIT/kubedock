@@ -27,6 +27,7 @@ type Container struct {
 	Cmd            []string
 	Env            []string
 	Binds          []string
+	Mounts         []Mount
 	PreArchives    []PreArchive
 	HostIP         string
 	ExposedPorts   map[string]interface{}
@@ -53,6 +54,14 @@ type PreArchive struct {
 	Archive []byte
 }
 
+// Mount contains the details of a mounted volume/binding.
+type Mount struct {
+	Type     string
+	Source   string
+	Target   string
+	ReadOnly bool
+}
+
 const (
 	// LabelRequestCPU is the label to be used to specify cpu request/limits
 	LabelRequestCPU = "com.joyrex2001.kubedock.request-cpu"
@@ -69,6 +78,8 @@ const (
 	// LabelRunasUser is the label to be used to enforce a specific user (uid) that
 	// runs inside the container can also be enforced w
 	LabelRunasUser = "com.joyrex2001.kubedock.runas-user"
+	// LabelActiveDeadlineSeconds is the label to be used to specify active deadline in seconds
+	LabelActiveDeadlineSeconds = "com.joyrex2001.kubedock.active-deadline-seconds"
 )
 
 // GetEnvVar will return the environment variables of the container
@@ -110,11 +121,15 @@ func (co *Container) GetImagePullPolicy() (corev1.PullPolicy, error) {
 // GetResourceRequirements will return a k8s request/limits configuration
 // based on the LabelRequestCPU and LabelRequestMemory labels set on the
 // container.
-func (co *Container) GetResourceRequirements() (corev1.ResourceRequirements, error) {
-	req := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{},
-		Limits:   corev1.ResourceList{},
+func (co *Container) GetResourceRequirements(req corev1.ResourceRequirements) (corev1.ResourceRequirements, error) {
+	if req.Requests == nil {
+		req.Requests = corev1.ResourceList{}
 	}
+
+	if req.Limits == nil {
+		req.Limits = corev1.ResourceList{}
+	}
+
 	for typ, labl := range map[string]string{"cpu": LabelRequestCPU, "memory": LabelRequestMemory} {
 		rls, ok := co.Labels[labl]
 		if !ok {
@@ -148,6 +163,7 @@ func (co *Container) GetResourceRequirements() (corev1.ResourceRequirements, err
 			req.Limits[corev1.ResourceName(typ)] = lt
 		}
 	}
+
 	return req, nil
 }
 
@@ -163,8 +179,21 @@ func (co *Container) GetServiceAccountName(current string) string {
 	return current
 }
 
+// GetActiveDeadlineSeconds will return the active deadline seconds to be used for containers
+// that are deployed.
+func (co *Container) GetActiveDeadlineSeconds() (*int64, error) {
+	if ads, ok := co.Labels[LabelActiveDeadlineSeconds]; ok {
+		parsed, err := strconv.ParseInt(ads, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse %s to Int64", ads)
+		}
+		return &parsed, nil
+	}
+	return nil, nil
+}
+
 // GetPodName will return a human friendly name that can be used for the
-// the container deployments.
+// container deployments.
 func (co *Container) GetPodName() string {
 	name := co.Name
 	if prefix, ok := co.Labels[LabelNamePrefix]; ok {
@@ -187,7 +216,7 @@ func (co *Container) GetPodName() string {
 }
 
 // GetPodSecurityContext will create a security context for the Pod that implements
-// the relenvant features of the Docker API. Right now this only covers the ability
+// the relevant features of the Docker API. Right now this only covers the ability
 // to specify the numeric user a container should run as.
 func (co *Container) GetPodSecurityContext(context *corev1.PodSecurityContext) (*corev1.PodSecurityContext, error) {
 	user, ok := co.Labels[LabelRunasUser]
@@ -325,6 +354,9 @@ func (co *Container) GetVolumes() map[string]string {
 		f := strings.Split(bind, ":")
 		mounts[f[1]] = f[0]
 	}
+	for _, mount := range co.Mounts {
+		mounts[mount.Target] = mount.Source
+	}
 	return mounts
 }
 
@@ -347,11 +379,22 @@ func (co *Container) GetVolumeFolders() map[string]string {
 func (co *Container) GetVolumeFiles() map[string]string {
 	mounts := map[string]string{}
 	for dst, src := range co.GetVolumes() {
-		if info, err := os.Stat(src); err == nil && !info.IsDir() {
+		if info, err := os.Stat(src); err == nil && !info.IsDir() && dst != "/var/run/docker.sock" {
 			mounts[dst] = src
 		}
 	}
 	return mounts
+}
+
+// HasDockerSockBinding will check the bindings specified in the container
+// and will return true if one pf these bindings is the docker socket.
+func (co *Container) HasDockerSockBinding() bool {
+	for dst := range co.GetVolumes() {
+		if dst == "/var/run/docker.sock" {
+			return true
+		}
+	}
+	return false
 }
 
 // GetPreArchiveFiles will return all single files from the pre-archives as
@@ -453,18 +496,18 @@ func (co *Container) Match(typ string, key string, val string) bool {
 // StateString returns a string that describes the state.
 func (co *Container) StateString() string {
 	if co.Running {
-		return "Up"
+		return "running"
 	}
 	if co.Stopped || co.Killed {
-		return "Dead"
+		return "dead"
 	}
 	if co.Failed {
-		return "Dead"
+		return "dead"
 	}
 	if co.Completed {
-		return "Exited"
+		return "exited"
 	}
-	return "Created"
+	return "created"
 }
 
 // StatusString returns a string that describes the status.

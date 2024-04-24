@@ -14,12 +14,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/klog"
 
 	"github.com/joyrex2001/kubedock/internal/config"
 	"github.com/joyrex2001/kubedock/internal/model/types"
 	"github.com/joyrex2001/kubedock/internal/util/exec"
-	"github.com/joyrex2001/kubedock/internal/util/podtemplate"
 	"github.com/joyrex2001/kubedock/internal/util/portforward"
 	"github.com/joyrex2001/kubedock/internal/util/reverseproxy"
 	"github.com/joyrex2001/kubedock/internal/util/tar"
@@ -62,54 +62,60 @@ func (in *instance) StartContainer(tainr *types.Container) (DeployState, error) 
 		if klog.V(2) {
 			klog.Infof("container %s log output:", tainr.ShortID)
 			stop := make(chan struct{}, 1)
-			_ = in.GetLogs(tainr, false, 100, stop, os.Stderr)
+			count := uint64(100)
+			logOpts := LogOptions{TailLines: &count}
+			_ = in.GetLogs(tainr, &logOpts, stop, os.Stderr)
 			close(stop)
 		}
 		_ = in.cli.CoreV1().Pods(in.namespace).Delete(context.Background(), tainr.GetPodName(), metav1.DeleteOptions{})
 		if quotaRetries == MaxQuotaExceededRetries {
 			// adjust error message
 			err = fmt.Errorf("%v. Timeout after %v retries of %v sec each (%v sec total)",
-					err.Error(), quotaRetries, MaxQuotaExceededRetries, quotaRetries * MaxQuotaExceededRetries)
+				err.Error(), quotaRetries, MaxQuotaExceededRetries, quotaRetries*MaxQuotaExceededRetries)
 		}
 	}
 	return state, err
 }
 
 func (in *instance) startContainer(tainr *types.Container) (DeployState, error) {
-	reqlimits, err := tainr.GetResourceRequirements()
-	if err != nil {
-		return DeployFailed, err
-	}
-
 	pulpol, err := tainr.GetImagePullPolicy()
 	if err != nil {
 		return DeployFailed, err
 	}
 
-	pod := &corev1.Pod{}
-	if in.podTemplate != "" {
-		pod, err = podtemplate.PodFromFile(in.podTemplate)
-		if err != nil {
-			return DeployFailed, fmt.Errorf("error opening podtemplate: %w", err)
-		}
-	}
-
+	pod := in.podTemplate.DeepCopy()
 	pod.ObjectMeta.Name = tainr.GetPodName()
 	pod.ObjectMeta.Namespace = in.namespace
 	pod.ObjectMeta.Labels = in.getLabels(pod.ObjectMeta.Labels, tainr)
 	pod.ObjectMeta.Annotations = in.getAnnotations(pod.ObjectMeta.Annotations, tainr)
-	pod.Spec.Containers = []corev1.Container{{
-		Image:           tainr.Image,
-		Name:            "main",
-		Command:         tainr.Entrypoint,
-		Args:            tainr.Cmd,
-		Env:             tainr.GetEnvVar(),
-		Ports:           in.getContainerPorts(tainr),
-		Resources:       reqlimits,
-		ImagePullPolicy: pulpol,
-	}}
+
+	container := in.containerTemplate
+	container.Image = tainr.Image
+	container.Name = "main"
+	container.Command = tainr.Entrypoint
+	container.Args = tainr.Cmd
+	container.Env = tainr.GetEnvVar()
+	container.Ports = in.getContainerPorts(tainr)
+	container.ImagePullPolicy = pulpol
+
+	reqlimits, err := tainr.GetResourceRequirements(container.Resources)
+	if err != nil {
+		return DeployFailed, err
+	}
+	container.Resources = reqlimits
+
+	pod.Spec.Containers = []corev1.Container{container}
+
 	pod.Spec.ServiceAccountName = tainr.GetServiceAccountName(pod.Spec.ServiceAccountName)
 	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+
+	ads, err := tainr.GetActiveDeadlineSeconds()
+	if err != nil {
+		return DeployFailed, err
+	}
+	if ads != nil {
+		pod.Spec.ActiveDeadlineSeconds = ads
+	}
 
 	seccontext, err := tainr.GetPodSecurityContext(pod.Spec.SecurityContext)
 	if err != nil {
@@ -130,6 +136,12 @@ func (in *instance) startContainer(tainr *types.Container) (DeployState, error) 
 	// add hard-coded nodeSelector
 	pod.Spec.NodeSelector = make(map[string]string)
 	pod.Spec.NodeSelector["compute"] = "general"
+
+	if tainr.HasDockerSockBinding() && !in.disableDind {
+		if err := in.addDindSidecar(tainr, pod); err != nil {
+			return DeployFailed, err
+		}
+	}
 
 	if _, err := in.cli.CoreV1().Pods(in.namespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 		return DeployFailed, err
@@ -152,6 +164,12 @@ func (in *instance) startContainer(tainr *types.Container) (DeployState, error) 
 
 	if err := in.createServices(tainr); err != nil {
 		return state, err
+	}
+
+	if tainr.HasDockerSockBinding() {
+		if err := in.handleDindCompleted(tainr); err != nil {
+			return DeployFailed, err
+		}
 	}
 
 	return state, nil
@@ -180,14 +198,19 @@ func (in *instance) portForward(tainr *types.Container, ports map[int]int) error
 		}
 		stop := make(chan struct{}, 1)
 		tainr.AddStopChannel(stop)
-		go portforward.ToPod(portforward.Request{
-			RestConfig: in.cfg,
-			Pod:        *pod,
-			LocalPort:  src,
-			PodPort:    dst,
-			StopCh:     stop,
-			ReadyCh:    make(chan struct{}, 1),
-		})
+		go func(src, dst int) {
+			err := portforward.ToPod(portforward.Request{
+				RestConfig: in.cfg,
+				Pod:        *pod,
+				LocalPort:  src,
+				PodPort:    dst,
+				StopCh:     stop,
+				ReadyCh:    make(chan struct{}, 1),
+			})
+			if err != nil {
+				klog.Errorf("port-forward failed: %s", err)
+			}
+		}(src, dst)
 	}
 	return nil
 }
@@ -309,6 +332,9 @@ func (in *instance) getLabels(labels map[string]string, tainr *types.Container) 
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	for k, v := range config.DefaultLabels {
+		labels[k] = v
+	}
 	for k, v := range tainr.Labels {
 		kk := in.toKubernetesKey(k)
 		kv := in.toKubernetesValue(v)
@@ -322,7 +348,7 @@ func (in *instance) getLabels(labels map[string]string, tainr *types.Container) 
 		}
 		labels[kk] = kv
 	}
-	for k, v := range config.DefaultLabels {
+	for k, v := range config.SystemLabels {
 		labels[k] = v
 	}
 	labels["kubedock.containerid"] = tainr.ShortID
@@ -335,6 +361,9 @@ func (in *instance) getLabels(labels map[string]string, tainr *types.Container) 
 func (in *instance) getAnnotations(annotations map[string]string, tainr *types.Container) map[string]string {
 	if annotations == nil {
 		annotations = map[string]string{}
+	}
+	for k, v := range config.DefaultAnnotations {
+		annotations[k] = v
 	}
 	for k, v := range tainr.Labels {
 		annotations[k] = v
@@ -351,7 +380,7 @@ func (in *instance) getPodMatchLabels(tainr *types.Container) map[string]string 
 	}
 }
 
-// waitReadyState will wait for the deploymemt to be ready.
+// waitReadyState will wait for the deployment to be ready.
 func (in *instance) waitReadyState(tainr *types.Container, wait int) (DeployState, error) {
 	for max := 0; max < wait; max++ {
 		status, err := in.GetContainerStatus(tainr)
@@ -370,10 +399,16 @@ func (in *instance) GetContainerStatus(tainr *types.Container) (DeployState, err
 		return DeployFailed, err
 	}
 	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name != "main" {
+			continue
+		}
 		term := status.State.Terminated
 		ters := status.LastTerminationState.Terminated
 		if (ters != nil && ters.Reason == "Completed") || (term != nil && term.Reason == "Completed") {
 			return DeployCompleted, nil
+		}
+		if term != nil && term.ExitCode != 0 {
+			return DeployFailed, fmt.Errorf("failed to start container")
 		}
 		if status.RestartCount > 0 {
 			return DeployFailed, fmt.Errorf("failed to start container")
@@ -426,12 +461,12 @@ func (in *instance) addVolumes(tainr *types.Container, pod *corev1.Pod) error {
 		return err
 	}
 
-	pod.Spec.InitContainers = []corev1.Container{{
-		Name:            "setup",
-		Image:           in.initImage,
-		ImagePullPolicy: pulpol,
-		Command:         []string{"sh", "-c", "while [ ! -f /tmp/done ]; do sleep 0.1 ; done"},
-	}}
+	container := in.containerTemplate
+	container.Name = "setup"
+	container.Image = in.initImage
+	container.ImagePullPolicy = pulpol
+	container.Command = []string{"sh", "-c", "while [ ! -f /tmp/done ]; do sleep 0.1 ; done"}
+	pod.Spec.InitContainers = []corev1.Container{container}
 
 	volumes := []corev1.Volume{}
 	mounts := []corev1.VolumeMount{}
@@ -492,6 +527,69 @@ func (in *instance) addVolumes(tainr *types.Container, pod *corev1.Pod) error {
 	pod.Spec.Volumes = volumes
 	pod.Spec.Containers[0].VolumeMounts = mounts
 	pod.Spec.InitContainers[0].VolumeMounts = mounts
+
+	return nil
+}
+
+// addDindSidecar will add a docker-in-docker sidecar, adding a volume
+// with /var/run/docker.sock to support docker-in-docker.
+func (in *instance) addDindSidecar(tainr *types.Container, pod *corev1.Pod) error {
+	pulpol, err := tainr.GetImagePullPolicy()
+	if err != nil {
+		return err
+	}
+
+	container := in.containerTemplate
+	container.Name = "dind-sidecar"
+	container.Image = in.dindImage
+	container.ImagePullPolicy = pulpol
+	container.Command = []string{"kubedock", "dind", "--kubedock-url", in.kuburl}
+	pod.Spec.Containers = append([]corev1.Container{container}, pod.Spec.Containers...)
+
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name:         "dind-socket",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+	)
+
+	mount := corev1.VolumeMount{
+		Name:      "dind-socket",
+		MountPath: "/var/run",
+	}
+	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, mount)
+	pod.Spec.Containers[1].VolumeMounts = append(pod.Spec.Containers[1].VolumeMounts, mount)
+
+	return nil
+}
+
+// handleDindCompleted will shutdown the dind sidecar when the main
+// container is completed to get the pod in a completed state.
+func (in *instance) handleDindCompleted(tainr *types.Container) error {
+	watcher, err := in.cli.CoreV1().Pods(in.namespace).Watch(context.TODO(), metav1.ListOptions{
+		LabelSelector: "kubedock.containerid=" + tainr.ShortID,
+	})
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		defer watcher.Stop()
+
+		for event := range watcher.ResultChan() {
+			if event.Type == watch.Modified {
+				status, err := in.GetContainerStatus(tainr)
+				if err != nil {
+					klog.Errorf("error getting container status: %s", err)
+					return
+				}
+				if status != DeployPending && status != DeployRunning {
+					if err := in.touchFileInContainer(tainr, "dind-sidecar", "/var/run/shutdown"); err != nil {
+						klog.Errorf("error triggering shutdown dind-sidecar: %s", err)
+					}
+					return
+				}
+			}
+		}
+	}()
 
 	return nil
 }
@@ -575,7 +673,7 @@ func (in *instance) copyVolumeFolders(tainr *types.Container, wait int) error {
 		}
 	}
 
-	return in.signalDone(tainr)
+	return in.touchFileInContainer(tainr, "setup", "/tmp/done")
 }
 
 // fileID will create an unique k8s compatible id to refer to the given file.
@@ -583,18 +681,20 @@ func (in *instance) fileID(file string) string {
 	return fmt.Sprintf("%x", md5.Sum([]byte(file)))
 }
 
-// signalDone will signal the prepare init container to exit.
-func (in *instance) signalDone(tainr *types.Container) error {
+// touchFileInContainer will touch a file in given container to signal
+// processes running in the container.
+func (in *instance) touchFileInContainer(tainr *types.Container, container, filename string) error {
 	pod, err := in.cli.CoreV1().Pods(in.namespace).Get(context.Background(), tainr.GetPodName(), metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
+
 	return exec.RemoteCmd(exec.Request{
 		Client:     in.cli,
 		RestConfig: in.cfg,
 		Pod:        *pod,
-		Container:  "setup",
-		Cmd:        []string{"touch", "/tmp/done"},
+		Container:  container,
+		Cmd:        []string{"touch", filename},
 		Stderr:     os.Stderr,
 	})
 }

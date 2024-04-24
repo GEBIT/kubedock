@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"k8s.io/klog"
 
+	"github.com/joyrex2001/kubedock/internal/backend"
 	"github.com/joyrex2001/kubedock/internal/events"
 	"github.com/joyrex2001/kubedock/internal/server/httputil"
 )
@@ -132,24 +133,22 @@ func ContainerStop(cr *ContextRouter, c *gin.Context) {
 // POST "/libpod/containers/:id/kill"
 func ContainerKill(cr *ContextRouter, c *gin.Context) {
 	id := c.Param("id")
-	tainr, err := cr.DB.GetContainer(id)
+	tainr, err := cr.DB.GetContainerByNameOrID(id)
 	if err != nil {
 		httputil.Error(c, http.StatusNotFound, err)
 		return
 	}
 
 	signal := strings.ToLower(c.Query("signal"))
-	if strings.Contains(signal, "int") {
-		tainr.SignalDetach()
-		if err := cr.DB.SaveContainer(tainr); err != nil {
-			httputil.Error(c, http.StatusInternalServerError, err)
-			return
-		}
-		c.Writer.WriteHeader(http.StatusNoContent)
-		return
+
+	valid := map[string]bool{
+		"kil":  true,
+		"term": true,
+		"quit": true,
+		"int":  true,
 	}
 
-	if signal != "" && !strings.Contains(signal, "kil") && !strings.Contains(signal, "term") && !strings.Contains(signal, "quit") {
+	if signal != "" && !valid[signal] {
 		klog.Infof("ignoring signal %s", signal)
 		c.Writer.WriteHeader(http.StatusNoContent)
 		return
@@ -185,7 +184,7 @@ func ContainerKill(cr *ContextRouter, c *gin.Context) {
 // POST "/libpod/containers/:id/attach"
 func ContainerAttach(cr *ContextRouter, c *gin.Context) {
 	id := c.Param("id")
-	tainr, err := cr.DB.GetContainer(id)
+	tainr, err := cr.DB.GetContainerByNameOrID(id)
 	if err != nil {
 		httputil.Error(c, http.StatusNotFound, err)
 		return
@@ -230,11 +229,11 @@ func ContainerAttach(cr *ContextRouter, c *gin.Context) {
 	stop := make(chan struct{}, 1)
 	tainr.AddAttachChannel(stop)
 
-	if err := cr.Backend.GetLogs(tainr, true, 100, stop, out); err != nil {
+	count := uint64(100)
+	logOpts := backend.LogOptions{Follow: true, TailLines: &count}
+	if err := cr.Backend.GetLogs(tainr, &logOpts, stop, out); err != nil {
 		klog.V(3).Infof("error retrieving logs: %s", err)
 	}
-
-	klog.Info("done attaching!")
 
 	cr.Events.Publish(tainr.ID, events.Container, events.Detach)
 	cr.Events.Publish(tainr.ID, events.Container, events.Die)
@@ -247,7 +246,7 @@ func ContainerAttach(cr *ContextRouter, c *gin.Context) {
 // POST "/libpod/containers/:id/rezise"
 func ContainerResize(cr *ContextRouter, c *gin.Context) {
 	id := c.Param("id")
-	_, err := cr.DB.GetContainer(id)
+	_, err := cr.DB.GetContainerByNameOrID(id)
 	if err != nil {
 		httputil.Error(c, http.StatusNotFound, err)
 		return
@@ -263,7 +262,7 @@ func ContainerResize(cr *ContextRouter, c *gin.Context) {
 // GET "/libpod/containers/:id/rename"
 func ContainerRename(cr *ContextRouter, c *gin.Context) {
 	id := c.Param("id")
-	tainr, err := cr.DB.GetContainer(id)
+	tainr, err := cr.DB.GetContainerByNameOrID(id)
 	if err != nil {
 		httputil.Error(c, http.StatusNotFound, err)
 		return
