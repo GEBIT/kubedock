@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7-labs 
+
 ####################
 ## Build kubedock ## ----------------------------------------------------------
 ####################
@@ -6,11 +8,16 @@ FROM docker.io/golang:1.22 AS kubedock
 
 ARG CODE=github.com/joyrex2001/kubedock
 
-ADD . /go/src/${CODE}/
-RUN cd /go/src/${CODE} \
-    && make test build \
+WORKDIR /go/src/${CODE}/
+
+COPY go.mod go.sum .
+RUN go mod download
+
+ADD --exclude=start-kubedock.sh . ./
+
+RUN make test build \
     && mkdir /app \
-    && cp kubedock start-kubedock.sh /app
+    && cp kubedock /app
 
 #################
 ## Final image ## ------------------------------------------------------------
@@ -22,7 +29,6 @@ RUN apk add --no-cache ca-certificates \
     && update-ca-certificates
 
 COPY --from=kubedock /app /usr/local/bin
+COPY start-kubedock.sh /usr/local/bin
 
-WORKDIR /app
-
-ENTRYPOINT ["/app/start-kubedock.sh"]
+ENTRYPOINT ["/usr/local/bin/start-kubedock.sh"]
