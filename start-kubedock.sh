@@ -18,5 +18,5 @@ ENABLE_PRE_ARCHIVE="${KUBEDOCK_ENABLE_PRE_ARCHIVE:---pre-archive}"
   --request-cpu $REQ_LIM_CPU \
   --request-memory $REQ_LIM_MEM \
   --pull-policy $PULL_POLICY \
-  --reapmax $REAP_MAX
+  --reapmax $REAP_MAX \
   $@
