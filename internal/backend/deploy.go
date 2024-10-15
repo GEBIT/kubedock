@@ -135,9 +135,7 @@ func (in *instance) startContainer(tainr *types.Container) (DeployState, error) 
 		}
 	}
 
-	// add hard-coded nodeSelector
-	pod.Spec.NodeSelector = make(map[string]string)
-	pod.Spec.NodeSelector["compute"] = "general"
+	pod.Spec.NodeSelector = tainr.NodeSelector
 
 	if tainr.HasPreArchives() {
 		if err := in.addPreArchives(tainr, pod); err != nil {
