@@ -16,6 +16,18 @@ gox:
 docker:
 	docker build . -t joyrex2001/kubedock:latest
 
+tag:
+	docker tag joyrex2001/kubedock:latest docker-registry.local.gebit.de:5002/gebit-build-docker/joyrex2001/kubedock:latest
+
+tag-dev:
+	docker tag joyrex2001/kubedock:latest docker-registry.local.gebit.de:5002/gebit-build-docker/joyrex2001/kubedock:dev
+
+push:
+	docker push docker-registry.local.gebit.de:5002/gebit-build-docker/joyrex2001/kubedock:latest
+
+push-dev:
+	docker push docker-registry.local.gebit.de:5002/gebit-build-docker/joyrex2001/kubedock:dev
+
 clean:
 	rm -f kubedock
 	rm -rf dist
