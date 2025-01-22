@@ -12,6 +12,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
@@ -498,6 +499,13 @@ func (in *instance) createSetupInitContainer(tainr *types.Container) (*corev1.Co
 	container.Image = in.initImage
 	container.ImagePullPolicy = pulpol
 	container.Command = []string{"sh", "-c", "while [ ! -f /tmp/done ]; do sleep 0.1 ; done"}
+	// hard-code small resource request, so initContainer
+	// can start when a ResourceQuota is defined for the namespace
+	container.Resources.Requests = corev1.ResourceList{}
+	q, err := resource.ParseQuantity("100m")
+	container.Resources.Requests[corev1.ResourceName("cpu")] = q
+	q, err = resource.ParseQuantity("128Mi")
+	container.Resources.Requests[corev1.ResourceName("memory")] = q
 	return &container, nil
 }
 
