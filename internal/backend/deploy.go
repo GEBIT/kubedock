@@ -39,12 +39,27 @@ const (
 	DeployCompleted
 	// SetupInitContainerName in the name of the container used for setup
 	SetupInitContainerName = "setup"
+	// Max Number of retries in case of resource quota exceeded
+	MaxQuotaExceededRetries = 24
+	// Number of seconds to sleep between retries
+	RetrySleepSec = 10
 )
 
 // StartContainer will start given container object in kubernetes and
 // waits until it's started, or failed with an error.
 func (in *instance) StartContainer(tainr *types.Container) (DeployState, error) {
 	state, err := in.startContainer(tainr)
+	quotaRetries := 0
+	for state == DeployFailed && quotaRetries < MaxQuotaExceededRetries && strings.Contains(err.Error(), "exceeded quota:") {
+		state, err = in.startContainer(tainr)
+		quotaRetries = quotaRetries + 1
+		time.Sleep(RetrySleepSec * time.Second)
+		if klog.V(2) {
+			klog.Infof("container %s log output:", tainr.ShortID)
+			klog.Infof("quotaRetries: %v", quotaRetries)
+			klog.Infof("err: %v", err)
+		}
+	}
 	if state == DeployFailed {
 		if klog.V(2) {
 			klog.Infof("container %s log output:", tainr.ShortID)
@@ -55,6 +70,11 @@ func (in *instance) StartContainer(tainr *types.Container) (DeployState, error) 
 			close(stop)
 		}
 		_ = in.cli.CoreV1().Pods(in.namespace).Delete(context.Background(), tainr.GetPodName(), metav1.DeleteOptions{})
+		if quotaRetries == MaxQuotaExceededRetries {
+			// adjust error message
+			err = fmt.Errorf("%v. Timeout after %v retries of %v sec each (%v sec total)",
+				err.Error(), quotaRetries, MaxQuotaExceededRetries, quotaRetries*MaxQuotaExceededRetries)
+		}
 	}
 	return state, err
 }
